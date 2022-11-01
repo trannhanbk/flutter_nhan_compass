@@ -1,7 +1,7 @@
 # flutter_nhan_compass
 
 [![pub package](https://img.shields.io/pub/v/flutter_nhan_compass.svg)](https://pub.dartlang.org/packages/flutter_nhan_compass)
-
+Hi my name is NhanTran.
 A Flutter compass. The heading varies from 0-360, 0 being north.
 
 
@@ -14,7 +14,7 @@ To use this plugin, add `flutter_nhan_compass` as a [dependency in your pubspec.
 
 ```yaml
 dependencies:
-  flutter_nhan_compass: '^0.7.0'
+  flutter_nhan_compass: ^0.0.2
 ```
 
 ### iOS

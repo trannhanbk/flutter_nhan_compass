@@ -1,6 +1,6 @@
 name: flutter_nhan_compass
-description: A new flutter plugin project.
-version: 0.0.1
+description: A Flutter compass. The heading varies from 0-360, 0 being north.
+version: 0.0.8
 homepage: https://github.com/trannhanbk/flutter_nhan_compass
 
 environment:

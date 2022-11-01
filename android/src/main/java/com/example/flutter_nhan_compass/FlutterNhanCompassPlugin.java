@@ -1,38 +1,383 @@
 package com.example.flutter_nhan_compass;
 
+import android.content.Context;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.hardware.display.DisplayManager;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.Surface;
+import android.view.Display;
+
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
-import io.flutter.plugin.common.MethodCall;
-import io.flutter.plugin.common.MethodChannel;
-import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
-import io.flutter.plugin.common.MethodChannel.Result;
+import io.flutter.embedding.engine.plugins.activity.ActivityAware;
+import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding;
+import io.flutter.plugin.common.EventChannel;
+import io.flutter.plugin.common.EventChannel.EventSink;
+import io.flutter.plugin.common.EventChannel.StreamHandler;
 
-/** FlutterNhanCompassPlugin */
-public class FlutterNhanCompassPlugin implements FlutterPlugin, MethodCallHandler {
-  /// The MethodChannel that will the communication between Flutter and native Android
-  ///
-  /// This local reference serves to register the plugin with the Flutter Engine and unregister it
-  /// when the Flutter Engine is detached from the Activity
-  private MethodChannel channel;
+public final class FlutterNhanCompassPlugin implements FlutterPlugin, ActivityAware, StreamHandler {
+    private static final String TAG = "FlutterCompass";
+    // The rate sensor events will be delivered at. As the Android documentation
+    // states, this is only a hint to the system and the events might actually be
+    // received faster or slower than this specified rate. Since the minimum
+    // Android API levels about 9, we are able to set this value ourselves rather
+    // than using one of the provided constants which deliver updates too quickly
+    // for our use case. The default is set to 100ms
+    private static final int SENSOR_DELAY_MICROS = 30 * 1000;
 
-  @Override
-  public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding) {
-    channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "flutter_nhan_compass");
-    channel.setMethodCallHandler(this);
-  }
+    // Filtering coefficient 0 < ALPHA < 1
+    private static final float ALPHA = 0.45f;
 
-  @Override
-  public void onMethodCall(@NonNull MethodCall call, @NonNull Result result) {
-    if (call.method.equals("getPlatformVersion")) {
-      result.success("Android " + android.os.Build.VERSION.RELEASE);
-    } else {
-      result.notImplemented();
+    // Controls the compass update rate in milliseconds
+    private static final int COMPASS_UPDATE_RATE_MS = 32;
+
+    private EventChannel sensorEventChannel;
+
+    private SensorEventListener sensorEventListener;
+
+    private Display display;
+    private SensorManager sensorManager;
+
+    @Nullable
+    private Sensor compassSensor;
+    @Nullable
+    private Sensor gravitySensor;
+    @Nullable
+    private Sensor magneticFieldSensor;
+
+    private float[] truncatedRotationVectorValue = new float[4];
+    private float[] rotationMatrix = new float[9];
+    private float[] rotationVectorValue;
+    private float lastHeading;
+    private int lastAccuracySensorStatus;
+
+    private long compassUpdateNextTimestamp;
+    private float[] gravityValues = new float[3];
+    private float[] magneticValues = new float[3];
+
+    public FlutterNhanCompassPlugin() {
     }
-  }
 
-  @Override
-  public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-    channel.setMethodCallHandler(null);
-  }
+
+    // public static void registerWith(Registrar registrar) {
+    //     EventChannel channel = new EventChannel(registrar.messenger(), "nhantranbk/flutter_nhan_compass");
+    //     channel.setStreamHandler(new FlutterCompassPlugin(registrar.context(), Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GEOMAGNETIC_ROTATION_VECTOR));
+    // }
+
+    // New Plugin APIs
+
+    @Override
+    public void onAttachedToActivity(@NonNull ActivityPluginBinding binding) {
+        Log.d(TAG, "Attaching compass to activity");
+        display = ((DisplayManager)binding.getActivity().getApplicationContext().getSystemService(Context.DISPLAY_SERVICE)).getDisplay(Display.DEFAULT_DISPLAY);
+        sensorManager = (SensorManager)binding.getActivity().getApplicationContext().getSystemService(Context.SENSOR_SERVICE);
+        compassSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR);
+        if (compassSensor == null) {
+            Log.d(TAG, "Rotation vector sensor not supported on device, falling back to accelerometer and magnetic field.");
+        }
+
+        gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+        magneticFieldSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD);
+    }
+
+    @Override
+    public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
+        sensorEventChannel = new EventChannel(binding.getBinaryMessenger(), "nhantranbk/flutter_nhan_compass");
+        sensorEventChannel.setStreamHandler(this);
+    }
+
+    @Override
+    public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
+        if (sensorEventChannel != null) {
+            sensorEventChannel.setStreamHandler(null);
+            sensorEventChannel = null;
+        }
+    }
+
+    @Override
+    public void onDetachedFromActivity() {
+        Log.d(TAG, "Detaching compass from activity");
+        shutdownListeners();
+    }
+
+    @Override
+    public void onDetachedFromActivityForConfigChanges() {
+    }
+
+    @Override
+    public void onReattachedToActivityForConfigChanges(@NonNull ActivityPluginBinding binding) {
+    }
+
+    public void onListen(Object arguments, EventSink events) {
+        Log.d(TAG, "onListen");
+        shutdownListeners();
+        startListeners(events);
+    }
+
+    public void onCancel(Object arguments) {
+        Log.d(TAG, "onCancel");
+        shutdownListeners();
+    }
+
+    private boolean isCompassSensorAvailable() {
+        return compassSensor != null;
+    }
+
+    private void shutdownListeners() {
+        if (sensorManager != null) {
+            if (isCompassSensorAvailable() && (sensorEventListener != null)) {
+                sensorManager.unregisterListener(sensorEventListener, compassSensor);
+            }
+
+            if ((gravitySensor != null) && (sensorEventListener != null)) {
+                sensorManager.unregisterListener(sensorEventListener, gravitySensor);
+            }
+            if ((magneticFieldSensor != null) && (sensorEventListener != null)) {
+                sensorManager.unregisterListener(sensorEventListener, magneticFieldSensor);
+            }
+        }
+
+        sensorEventListener = null;
+    }
+
+    private void startListeners(final EventSink events) {
+        if (sensorEventListener == null) {
+            sensorEventListener = createSensorEventListener(events);
+        }
+
+        if (isCompassSensorAvailable()) {
+            // Does nothing if the sensors already registered.
+            sensorManager.registerListener(sensorEventListener, compassSensor, SENSOR_DELAY_MICROS);
+        }
+
+        // Does nothing if the sensors already registered.
+        sensorManager.registerListener(sensorEventListener, gravitySensor, SENSOR_DELAY_MICROS);
+        // Does nothing if the sensors already registered.
+        sensorManager.registerListener(sensorEventListener, magneticFieldSensor, SENSOR_DELAY_MICROS);
+    }
+
+    SensorEventListener createSensorEventListener(final EventSink events) {
+        return new SensorEventListener() {
+            @Override
+            public void onSensorChanged(SensorEvent event) {
+                if (lastAccuracySensorStatus == SensorManager.SENSOR_STATUS_UNRELIABLE) {
+                    Log.d(TAG, "Compass sensor is unreliable, device calibration is needed.");
+                    // Update the heading, even if the sensor is unreliable.
+                    // This makes it possible to use a different indicator for the unreliable case,
+                    // instead of just changing the RenderMode to NORMAL.
+                }
+                if (event.sensor.getType() == Sensor.TYPE_ROTATION_VECTOR) {
+                    rotationVectorValue = getRotationVectorFromSensorEvent(event);
+                    updateOrientation();
+                } else if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER && !isCompassSensorAvailable()) {
+                    gravityValues = lowPassFilter(getRotationVectorFromSensorEvent(event), gravityValues);
+                    updateOrientation();
+                } else if (event.sensor.getType() == Sensor.TYPE_MAGNETIC_FIELD && !isCompassSensorAvailable()) {
+                    magneticValues = lowPassFilter(getRotationVectorFromSensorEvent(event), magneticValues);
+                    updateOrientation();
+                }
+            }
+
+            @Override
+            public void onAccuracyChanged(Sensor sensor, int accuracy) {
+                if (lastAccuracySensorStatus != accuracy) {
+                    lastAccuracySensorStatus = accuracy;
+                }
+            }
+
+            @SuppressWarnings("SuspiciousNameCombination")
+            private void updateOrientation() {
+                // check when the last time the compass was updated, return if too soon.
+                long currentTime = SystemClock.elapsedRealtime();
+                if (currentTime < compassUpdateNextTimestamp) {
+                    return;
+                }
+
+                if (rotationVectorValue != null) {
+                    SensorManager.getRotationMatrixFromVector(rotationMatrix, rotationVectorValue);
+                } else {
+                    // Get rotation matrix given the gravity and geomagnetic matrices
+                    SensorManager.getRotationMatrix(rotationMatrix, null, gravityValues, magneticValues);
+                }
+
+                int worldAxisForDeviceAxisX;
+                int worldAxisForDeviceAxisY;
+
+                // Assume the device screen was parallel to the ground,
+                // and adjust the rotation matrix for the device orientation.
+                switch (display.getRotation()) {
+                    case Surface.ROTATION_90:
+                        worldAxisForDeviceAxisX = SensorManager.AXIS_Y;
+                        worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_X;
+                        break;
+                    case Surface.ROTATION_180:
+                        worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_X;
+                        worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_Y;
+                        break;
+                    case Surface.ROTATION_270:
+                        worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_Y;
+                        worldAxisForDeviceAxisY = SensorManager.AXIS_X;
+                        break;
+                    case Surface.ROTATION_0:
+                    default:
+                        worldAxisForDeviceAxisX = SensorManager.AXIS_X;
+                        worldAxisForDeviceAxisY = SensorManager.AXIS_Y;
+                        break;
+                }
+
+                float[] adjustedRotationMatrix = new float[9];
+                SensorManager.remapCoordinateSystem(rotationMatrix, worldAxisForDeviceAxisX, worldAxisForDeviceAxisY,
+                        adjustedRotationMatrix);
+
+                // Transform rotation matrix into azimuth/pitch/roll
+                float[] orientation = new float[3];
+                SensorManager.getOrientation(adjustedRotationMatrix, orientation);
+
+                if (orientation[1] < -Math.PI / 4) {
+                    // The pitch is less than -45 degrees.
+                    // Remap the axes as if the device screen was the instrument panel.
+                    switch (display.getRotation()) {
+                        case Surface.ROTATION_90:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_Z;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_X;
+                            break;
+                        case Surface.ROTATION_180:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_X;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_Z;
+                            break;
+                        case Surface.ROTATION_270:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_Z;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_X;
+                            break;
+                        case Surface.ROTATION_0:
+                        default:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_X;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_Z;
+                            break;
+                    }
+                } else if (orientation[1] > Math.PI / 4) {
+                    // The pitch is larger than 45 degrees.
+                    // Remap the axes as if the device screen was upside down and facing back.
+                    switch (display.getRotation()) {
+                        case Surface.ROTATION_90:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_Z;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_X;
+                            break;
+                        case Surface.ROTATION_180:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_X;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_Z;
+                            break;
+                        case Surface.ROTATION_270:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_Z;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_X;
+                            break;
+                        case Surface.ROTATION_0:
+                        default:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_X;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_Z;
+                            break;
+                    }
+                } else if (Math.abs(orientation[2]) > Math.PI / 2) {
+                    // The roll is less than -90 degrees, or is larger than 90 degrees.
+                    // Remap the axes as if the device screen was face down.
+                    switch (display.getRotation()) {
+                        case Surface.ROTATION_90:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_Y;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_X;
+                            break;
+                        case Surface.ROTATION_180:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_MINUS_X;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_Y;
+                            break;
+                        case Surface.ROTATION_270:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_Y;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_X;
+                            break;
+                        case Surface.ROTATION_0:
+                        default:
+                            worldAxisForDeviceAxisX = SensorManager.AXIS_X;
+                            worldAxisForDeviceAxisY = SensorManager.AXIS_MINUS_Y;
+                            break;
+                    }
+                }
+
+                SensorManager.remapCoordinateSystem(rotationMatrix, worldAxisForDeviceAxisX, worldAxisForDeviceAxisY,
+                        adjustedRotationMatrix);
+
+                // Transform rotation matrix into azimuth/pitch/roll
+                SensorManager.getOrientation(adjustedRotationMatrix, orientation);
+
+                double[] v = new double[3];
+                v[0] = Math.toDegrees(orientation[0]);
+                v[2] = getAccuracy();
+                // The x-axis is all we care about here.
+                notifyCompassChangeListeners(v);
+
+                // Update the compassUpdateNextTimestamp
+                compassUpdateNextTimestamp = currentTime + COMPASS_UPDATE_RATE_MS;
+            }
+
+            private void notifyCompassChangeListeners(double[] heading) {
+                events.success(heading);
+                lastHeading = (float) heading[0];
+            }
+
+            private double getAccuracy() {
+                if (lastAccuracySensorStatus == SensorManager.SENSOR_STATUS_ACCURACY_HIGH) {
+                    return 15;
+                } else if (lastAccuracySensorStatus == SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM) {
+                    return 30;
+                } else if (lastAccuracySensorStatus == SensorManager.SENSOR_STATUS_ACCURACY_LOW) {
+                    return 45;
+                } else {
+                    return -1; // unknown
+                }
+            }
+
+            /**
+             * Helper function, that filters newValues, considering previous values
+             *
+             * @param newValues      array of float, that contains new data
+             * @param smoothedValues array of float, that contains previous state
+             * @return float filtered array of float
+             */
+            private float[] lowPassFilter(float[] newValues, float[] smoothedValues) {
+                if (smoothedValues == null) {
+                    return newValues;
+                }
+                for (int i = 0; i < newValues.length; i++) {
+                    smoothedValues[i] = smoothedValues[i] + ALPHA * (newValues[i] - smoothedValues[i]);
+                }
+                return smoothedValues;
+            }
+
+            /**
+             * Pulls out the rotation vector from a SensorEvent, with a maximum length
+             * vector of four elements to avoid potential compatibility issues.
+             *
+             * @param event the sensor event
+             * @return the events rotation vector, potentially truncated
+             */
+            @NonNull
+            private float[] getRotationVectorFromSensorEvent(@NonNull SensorEvent event) {
+                if (event.values.length > 4) {
+                    // On some Samsung devices SensorManager.getRotationMatrixFromVector
+                    // appears to throw an exception if rotation vector has length > 4.
+                    // For the purposes of this class the first 4 values of the
+                    // rotation vector are sufficient (see crbug.com/335298 for details).
+                    // Only affects Android 4.3
+                    System.arraycopy(event.values, 0, truncatedRotationVectorValue, 0, 4);
+                    return truncatedRotationVectorValue;
+                } else {
+                    return event.values;
+                }
+            }
+        };
+    }
 }
