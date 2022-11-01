@@ -1,7 +1,7 @@
 name: flutter_nhan_compass
 description: A new flutter plugin project.
 version: 0.0.1
-homepage:
+homepage: https://github.com/trannhanbk/flutter_nhan_compass
 
 environment:
   sdk: ">=2.16.2 <3.0.0"
