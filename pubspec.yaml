@@ -1,6 +1,6 @@
 name: flutter_nhan_compass
 description: A Flutter compass. The heading varies from 0-360, 0 being north.
-version: 0.0.8
+version: 1.0.0
 homepage: https://github.com/trannhanbk/flutter_nhan_compass
 
 environment:
